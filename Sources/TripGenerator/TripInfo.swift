@@ -21,22 +21,36 @@ public class TripInfo: Codable {
     let endDate: Date
     let endDateTimezoneId: String
     let countries: [TripCountry]
-    let health: [Health]
-    let daily: [DayInfo]
+    let images: [ImageInfo]
+    let health: [Health]            // Aggregated health stats for the entire trip
+    let dailyHealth: [Health]       // health stats for each day, 'date' is set
 
     public init(_ id: String,
                 _ startDate: Date, _ startTimezoneId: String,
                 _ endDate: Date, _ endTimezoneId: String,
-                _ countries: [TripCountry], _ daily: [DayInfo],
-                _ health: [Health]) {
+                _ countries: [TripCountry],
+                _ images: [ImageInfo],
+                _ health: [Health],
+                _ dailyHealth: [Health]) {
         self.id = id
         self.startDate = startDate
         self.startDateTimezoneId = startTimezoneId
         self.endDate = endDate
         self.endDateTimezoneId = endTimezoneId
         self.countries = countries
-        self.daily = daily
+        self.images = images
         self.health = health
+        self.dailyHealth = dailyHealth
+    }
+}
+
+public class TripDayDetail: Codable {
+    let id: String
+    let daily: [DayInfo]
+
+    public init(_ id: String, _ daily: [DayInfo]) {
+        self.id = id
+        self.daily = daily
     }
 }
 
@@ -54,17 +68,34 @@ public class TripCountry: Codable, CustomStringConvertible {
     }
 }
 
+public class TripDailyDetails: Codable {
+    let daily: [DayInfo]
+
+    public init(_ daily: [DayInfo]) {
+        self.daily = daily
+    }
+
+    public func encodeToJson() throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        return try encoder.encode(self)
+    }
+}
+
 public class DayInfo: Codable {
     let day: String
     let countries: [TripCountry]
-    let health: [Health]
-    let images: [ImageInfo]
+    let images: [ImageInfo]         // One image from each day
+    let health: [Health]            // Aggregated health stats for the day
+    let detailedHealth: [Health]    // Health stats during the day (eg, hourly). 'date' is set
 
-    public init(_ day: String, _ countries: [TripCountry], _ health: [Health], _ images: [ImageInfo]) {
+    public init(_ day: String, _ countries: [TripCountry], _ images: [ImageInfo],
+                _ health: [Health], _ detailedHealth: [Health]) {
         self.day = day
         self.countries = countries
-        self.health = health
         self.images = images
+        self.health = health
+        self.detailedHealth = detailedHealth
     }
 }
 
@@ -100,12 +131,14 @@ public class TripCity: Codable, CustomStringConvertible {
 
 public class Health: Codable, CustomStringConvertible {
     let sourceName: String
+    var date: Date?
     var steps: Int = 0
     var flights: Int = 0
     var meters: Double = 0
 
-    public init(_ sourceName: String) {
+    public init(_ sourceName: String, _ date: Date? = nil) {
         self.sourceName = sourceName
+        self.date = date
     }
 
     public var description: String {

@@ -14,8 +14,5 @@ let package = Package(
         .target(
             name: "TripGenerator",
             dependencies: ["Core", "Guaka", "HTTP", "SwiftyJSON"]),
-        .testTarget(
-            name: "TripGeneratorTests",
-            dependencies: ["TripGenerator"]),
     ]
 )

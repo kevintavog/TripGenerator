@@ -7,6 +7,10 @@ let ymdDashedDateFormatter = DateFormatter()
 ymdDashedDateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
 ymdDashedDateFormatter.dateFormat = "yyyy-MM-dd"
 
+let hourDateFormatter = DateFormatter()
+hourDateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+hourDateFormatter.dateFormat = "yyyy-MM-dd-hh"
+
 // FindAPhoto returns a 'date' string field in yyyyMMdd format and it needs to be converted to date instance
 let fpDateFormatter = DateFormatter()
 fpDateFormatter.dateFormat = "yyyyMMdd"
@@ -26,31 +30,14 @@ let flags = [findAPhotoUrlFlag, healthDataUrlFlag, outputFolderFlag, timezoneLoo
 var trips = [TripInfo]()
 
 
+func getHour(_ date: Date) -> String {
+    return hourDateFormatter.string(from: date)
+}
+
 //-------------------------------------------------------------------------------------------------
-func convertFpDateToDashed(_ fpDate: String) -> String {
-    let ymdDate = fpDateFormatter.date(from: fpDate)!
-    return ymdDashedDateFormatter.string(from: ymdDate)
-}
-
-func getFpTripResults(_ fpClient: HttpCalls, _ first: Int) throws -> FindAPhotoResponse {
-    let data = try fpClient.get(
-        path: "/api/search?properties=\(tripProperties)&q=\(tripQuery)&first=\(first)&count=100").wait()!
-    return try FindAPhotoResponse.fromJson(data: data)
-}
-
-func getTimezoneId(_ tlClient: HttpCalls, _ latitude: Double, _ longitude: Double) throws -> String {
-    let json = try tlClient.getJson(path: "/api/v1/timezone?lat=\(latitude)&lon=\(longitude)").wait()!
-    return json["id"].stringValue
-}
-
-func getHealthData(_ hdClient: HttpCalls, _ start: String, _ end: String) throws -> RecordsResponse {
-    let data = try hdClient.get(path: "/api/records/\(start)?end=\(end)").wait()!
-    return try RecordsResponse.fromJson(data: data)
-}
-
-func aggregateHealth(_ raw: RecordsResponse) -> ([Health], [String:[Health]]) {
+func aggregateHealth(_ raw: RecordsResponse) -> ([Health], [String:[Health]], [String:[Health]]) {
     if raw.records.count < 0 {
-        return ([Health](), [String:[Health]]())
+        return ([Health](), [String:[Health]](), [String:[Health]]())
     }
 
     // A map of device/source name -> Health (aggregate for the trip)
@@ -61,6 +48,7 @@ func aggregateHealth(_ raw: RecordsResponse) -> ([Health], [String:[Health]]) {
 
     //  A map of map of day -> [Health] (an instance per device/source name)
     var dailyHealthMap = [String:[Health]]()
+    var hourlyHealthMap = [String: [Health]]()
 
     // Aggregate each device over each day, for all data types
     for day in raw.records {
@@ -70,23 +58,35 @@ func aggregateHealth(_ raw: RecordsResponse) -> ([Health], [String:[Health]]) {
             let daily = step.records.reduce(0) { $0 + $1.count }
             findDayHealth(&dailyHealthMap, ymdDate, step.sourceName).steps = daily
             tripHealth.steps += daily
+
+            for sr in step.records {
+                findHourHealth(&hourlyHealthMap, getHour(sr.startUTC), step.sourceName).steps += sr.count
+            }
         }
         for flight in day.flights {
             let tripHealth = devAggregateMap[flight.sourceName]!
             let daily = flight.records.reduce(0) { $0 + $1.count }
             findDayHealth(&dailyHealthMap, ymdDate, flight.sourceName).flights = daily
             tripHealth.flights += daily
+
+            for sr in flight.records {
+                findHourHealth(&hourlyHealthMap, getHour(sr.startUTC), flight.sourceName).flights += sr.count
+            }
         }
         for distance in day.distances {
             let tripHealth = devAggregateMap[distance.sourceName]!
             let daily = distance.records.reduce(0.0) { $0 + $1.meters }
             findDayHealth(&dailyHealthMap, ymdDate, distance.sourceName).meters += daily
             tripHealth.meters += daily
+
+            for sr in distance.records {
+                findHourHealth(&hourlyHealthMap, getHour(sr.startUTC), distance.sourceName).meters += sr.meters
+            }
         }
     }
 
     let tripHealthList = devAggregateMap.values.filter { $0.steps > 0 || $0.flights > 0 || $0.meters > 0}
-    return (tripHealthList, dailyHealthMap)
+    return (tripHealthList, dailyHealthMap, hourlyHealthMap)
 }
 
 func findDayHealth(_ dayHealthMap: inout [String:[Health]], _ ymdDate: String, _ sourceName: String) -> Health {
@@ -103,26 +103,26 @@ func findDayHealth(_ dayHealthMap: inout [String:[Health]], _ ymdDate: String, _
     return health
 }
 
-func createTripInfo(_ collection: [FPGroupResponse], _ tlClient: HttpCalls, _ hdClient: HttpCalls, 
-                    _ findAPhotoUrl: String) throws {
-    if collection.count < 1 {
-        return
+func findHourHealth(_ hourHealthMap: inout [String:[Health]], _ hour: String, _ sourceName: String) -> Health {
+    var hourList = hourHealthMap[hour, default: [Health]()]
+    hourHealthMap[hour] = hourList
+    for h in hourList {
+        if h.sourceName == sourceName {
+            return h
+        }
     }
+    let health = Health(sourceName)
+    health.date = hourDateFormatter.date(from: hour)
+    hourList.append(health)
+    hourHealthMap[hour] = hourList
+    return health
+}
 
+func aggregatePhotos(_ collection: [FPGroupResponse], _ findAPhotoUrl: String) -> 
+        ([TripCountry], [String:[TripCountry]], [String:[ImageInfo]], FPGroupItemResponse, FPGroupItemResponse) {
+    // Aggregates for the entire trip
     var countryCityMap = [String:Set<String>]()
     var citySiteMap = [String:Set<String>]()
-
-    // Day: Country
-    var dayCountryMap = [String:Set<String>]()
-    // Day: [ Country: Cities<> ]
-    var dayCountryCitiesMap = [String:[String:Set<String>]]()
-    // Day: [ City: Sites<> ]
-    var dayCitySiteMap = [String:[String:Set<String>]]()
-
-    var earliest = collection.first!.items.first!
-    var latest = earliest
-
-    var dayImagesMap = [String:[ImageInfo]]()
 
     for group in collection {
         for loc in group.locations {
@@ -139,7 +139,28 @@ func createTripInfo(_ collection: [FPGroupResponse], _ tlClient: HttpCalls, _ hd
             }
             countryCityMap[loc.country] = cityNames
         }
+    }
 
+    let tripCountry = countryCityMap.map { (country: String, citySet: Set<String>) -> TripCountry in
+        let tripCityList = citySet.map { (cityName) in
+            TripCity(cityName, Array(citySiteMap[cityName]!).sorted())
+        }
+        return TripCountry(country, tripCityList.sorted { $0.name < $1.name })
+    }
+
+    // Day: Country
+    var dayCountryMap = [String:Set<String>]()
+    // Day: [ Country: Cities<> ]
+    var dayCountryCitiesMap = [String:[String:Set<String>]]()
+    // Day: [ City: Sites<> ]
+    var dayCitySiteMap = [String:[String:Set<String>]]()
+
+    var dayImagesMap = [String:[ImageInfo]]()
+
+    var earliest = collection.first!.items.first!
+    var latest = earliest
+
+    for group in collection {
         for item in group.items {
             let today = convertFpDateToDashed(item.date)
             var todayImageList = dayImagesMap[today, default: [ImageInfo]()]
@@ -170,62 +191,95 @@ func createTripInfo(_ collection: [FPGroupResponse], _ tlClient: HttpCalls, _ hd
 
             if item.createdDate < earliest.createdDate {
                 earliest = item
-            }
-            if item.createdDate > latest.createdDate {
+            } else if item.createdDate > latest.createdDate {
                 latest = item
             }
         }
     }
 
-    let tripCountryList = countryCityMap.map { (country: String, citySet: Set<String>) -> TripCountry in
-        let tripCityList = citySet.map { (cityName) in
-            TripCity(cityName, Array(citySiteMap[cityName]!).sorted())
-        }
-        return TripCountry(country, tripCityList.sorted { $0.name < $1.name })
-    }
-
-    var dayTripCountry = [String:[TripCountry]]()
+    var dayCountry = [String:[TripCountry]]()
     for (day, countrySet) in dayCountryMap {
         for country in countrySet {
             let cityList = dayCountryCitiesMap[day]![country]!.map { (cityName) -> TripCity in
                 return TripCity(cityName, Array(dayCitySiteMap[day]?[cityName] ?? []).sorted())
             }
-            var dayEntry = dayTripCountry[day, default: [TripCountry]()]
+            var dayEntry = dayCountry[day, default: [TripCountry]()]
             dayEntry.append(TripCountry(country, cityList))
-            dayTripCountry[day] = dayEntry
+            dayCountry[day] = dayEntry
         }
     }
-    // .flatMap { $0 }.filter { $0.name.count > 1 }.sorted { $0.day < $1.day }
 
+    return (tripCountry, dayCountry, dayImagesMap, earliest, latest)
+}
+
+func getDetailedHealth(_ hourly: [String:[Health]], _ day: String) -> [Health] {
+    var detailed = [Health]()
+    for k in hourly.keys {
+        if k.hasPrefix(day) {
+            detailed += hourly[k]!
+        }
+    }
+    return detailed.sorted { $0.date! < $1.date! }
+}
+
+func createTripInfo(_ collection: [FPGroupResponse], _ tlClient: HttpCalls, _ hdClient: HttpCalls, 
+                    _ findAPhotoUrl: String, _ dayInfoListVisit: ([DayInfo]) throws -> Void) throws {
+    if collection.count < 1 {
+        return
+    }
+
+    let (tripCountry, dayCountry, dayImages, earliest, latest) = aggregatePhotos(collection, findAPhotoUrl)
     let startTimezone = try getTimezoneId(tlClient, earliest.latitude!, earliest.longitude!)
     let endTimezone = latest.latitude != nil ?
-        try getTimezoneId(tlClient, latest.latitude!, latest.longitude!) :
-        startTimezone
+        try getTimezoneId(tlClient, latest.latitude!, latest.longitude!) : startTimezone
     let startString = convertFpDateToDashed(earliest.date)
     let endString = convertFpDateToDashed(latest.date)
 
-    let rawHealthData = try getHealthData(hdClient, startString, endString)
-    let (tripHealth, dailyHealth) = aggregateHealth(rawHealthData)
+    let (tripHealth, dailyHealth, hourlyHealth) = try aggregateHealth(getHealthData(hdClient, startString, endString))
 
     var allKeySet = Set(dailyHealth.keys)
-    allKeySet = allKeySet.union(Set(dayTripCountry.keys))
+    allKeySet = allKeySet.union(Set(dayCountry.keys))
     var dayInfo = [DayInfo]()
     for day in allKeySet {
+        let detailed = getDetailedHealth(hourlyHealth, day)
         dayInfo.append(DayInfo(
             day,
-            (dayTripCountry[day] ?? []).filter { $0.name.count > 1 },
+            (dayCountry[day] ?? []).filter { $0.name.count > 1 },
+            (dayImages[day] ?? []).sorted { $0.createdDate < $1.createdDate },
             dailyHealth[day] ?? [],
-            (dayImagesMap[day] ?? []).sorted { $0.createdDate < $1.createdDate }))
+            detailed))
+    }
+    dayInfo = dayInfo.sorted { $0.day < $1.day }
+    try dayInfoListVisit(dayInfo)
+
+    var tripImages = [ImageInfo]()
+    var tripDailyHealth = [Health]()
+    for di in dayInfo {
+        if di.images.count > 0 {
+            tripImages.append(di.images[di.images.count / 2])
+        }
+        for h in di.health {
+            let dh = h
+            dh.date = ymdDashedDateFormatter.date(from: di.day)
+            tripDailyHealth.append(dh)
+        }
     }
 
     let tripInfo = TripInfo(
         startString,
         earliest.createdDate, startTimezone,
         latest.createdDate, endTimezone,
-        tripCountryList,
-        dayInfo.sorted { $0.day < $1.day },
-        tripHealth)
+        tripCountry,
+        tripImages,
+        tripHealth,
+        tripDailyHealth)
     trips.append(tripInfo)
+}
+
+func writeDayInfoList(_ outputFolder: String, _ dayInfoList: [DayInfo]) throws {
+    let details = TripDailyDetails(dayInfoList)
+    let detailsJson = try details.encodeToJson()
+    try detailsJson.write(to: URL(fileURLWithPath: "\(outputFolder)/\(dayInfoList[0].day).json"))
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -255,6 +309,11 @@ let command = Command(usage: "TripGenerator", flags: flags) { flags, args in
             totalMatches = searchResults.totalMatches
         } while first < totalMatches
 
+        let visitDayInfoListWriter: ([DayInfo]) throws -> Void = { dl in
+            try writeDayInfoList(outputFolder, dl)
+        }
+
+
         // Split by gaps (collect those nearby in time)
         var currentCollection = [FPGroupResponse]()
         for idx in 1..<allGroups.count {
@@ -265,14 +324,14 @@ let command = Command(usage: "TripGenerator", flags: flags) { flags, args in
             let curDate = ymdDashedDateFormatter.date(from: cur.name)!
             let daysApart = prevDate.timeIntervalSince(curDate) / (24 * 60 * 60)
             if daysApart > 3 {
-                try createTripInfo(currentCollection, tlClient, hdClient, findAPhotoUrl)
+                try createTripInfo(currentCollection, tlClient, hdClient, findAPhotoUrl, visitDayInfoListWriter)
                 currentCollection.removeAll(keepingCapacity: true)
-// if trips.count == 2 {
-//     break
-// }
+if trips.count == 2 {
+    break
+}
             }
         }
-        try createTripInfo(currentCollection, tlClient, hdClient, findAPhotoUrl)
+        try createTripInfo(currentCollection, tlClient, hdClient, findAPhotoUrl, visitDayInfoListWriter)
 
         let tripsJson = try GeneratedTrips(trips).encodeToJson()
         try tripsJson.write(to: URL(fileURLWithPath: "\(outputFolder)/trips.json"))
